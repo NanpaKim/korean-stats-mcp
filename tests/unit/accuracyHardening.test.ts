@@ -1,11 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-
-vi.mock('../../src/tools/quickStats.js', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../../src/tools/quickStats.js')>();
-  return { ...actual, quickStats: vi.fn() };
-});
-
-import { quickStats } from '../../src/tools/quickStats.js';
+import { describe, expect, it } from 'vitest';
+import type { QuickStatsFetcher } from '../../src/tools/chains.js';
 import {
   chainCompareRegions,
   chainRegionBrief,
@@ -14,8 +8,6 @@ import {
 } from '../../src/tools/chains.js';
 import { classifyDistrictRowName } from '../../src/tools/quickRank.js';
 import { explainStatisticSchema } from '../../src/tools/explainStatistic.js';
-
-const mockedQuickStats = vi.mocked(quickStats);
 
 function result(
   keyword: string,
@@ -52,20 +44,21 @@ function result(
 }
 
 describe('지역 브리핑 정확성', () => {
-  beforeEach(() => mockedQuickStats.mockReset());
-
   it('상위지역 참고값을 직접값 성공률에서 제외하고 별도 표시한다', async () => {
-    mockedQuickStats.mockImplementation(async ({ query, region }) =>
+    const fakeStats: QuickStatsFetcher = async ({ query, region }) => (
       query === '인구'
         ? result(query, region!, region!, 'exact', '649715')
         : result(query, region!, '서울', 'parent')
     );
 
-    const brief = await chainRegionBrief({
-      region: '송파구',
-      includeNational: false,
-      format: 'detail',
-    });
+    const brief = await chainRegionBrief(
+      {
+        region: '송파구',
+        includeNational: false,
+        format: 'detail',
+      },
+      fakeStats
+    );
 
     expect(brief.coverage).toBe('1/13 지표 조회 성공');
     expect(brief.references).toHaveLength(12);
@@ -75,15 +68,18 @@ describe('지역 브리핑 정확성', () => {
   });
 
   it('고정 라벨 대신 실제 조회 항목명을 사용한다', async () => {
-    mockedQuickStats.mockImplementation(async ({ query, region }) =>
+    const fakeStats: QuickStatsFetcher = async ({ query, region }) => (
       result(query, region!, region!, 'exact')
     );
 
-    const brief = await chainRegionBrief({
-      region: '송파구',
-      includeNational: false,
-      format: 'detail',
-    });
+    const brief = await chainRegionBrief(
+      {
+        region: '송파구',
+        includeNational: false,
+        format: 'detail',
+      },
+      fakeStats
+    );
     const doctors = brief.indicators.find((indicator) => indicator.keyword === '의사수');
 
     expect(doctors?.label).toBe('의료기관 종사 의사수');
@@ -95,19 +91,20 @@ describe('지역 브리핑 정확성', () => {
 });
 
 describe('다지역 비교 정확성', () => {
-  beforeEach(() => mockedQuickStats.mockReset());
-
   it('상위지역 참고값을 순위에서 제외한다', async () => {
-    mockedQuickStats.mockImplementation(async ({ query, region }) =>
+    const fakeStats: QuickStatsFetcher = async ({ query, region }) => (
       region === '송파구'
         ? result(query, region, '서울', 'parent', '100')
         : result(query, region!, region!, 'exact', '50')
     );
 
-    const compared = await chainCompareRegions({
-      regions: ['송파구', '강남구'],
-      keywords: ['GRDP'],
-    });
+    const compared = await chainCompareRegions(
+      {
+        regions: ['송파구', '강남구'],
+        keywords: ['GRDP'],
+      },
+      fakeStats
+    );
 
     expect(compared.insights[0].ranking).toHaveLength(1);
     expect(compared.insights[0].ranking[0].region).toBe('강남구');

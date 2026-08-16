@@ -8,7 +8,11 @@
  */
 
 import { z } from 'zod';
-import { quickStats, type QuickStatsResult } from './quickStats.js';
+import {
+  quickStats,
+  type QuickStatsInput,
+  type QuickStatsResult,
+} from './quickStats.js';
 import { quickTrend } from './quickTrend.js';
 import { parseKosisNumber } from '../utils/dataFormatter.js';
 import { mapWithConcurrency, CHAIN_CONCURRENCY } from '../utils/concurrency.js';
@@ -45,6 +49,8 @@ export function hasExactValue(result: QuickStatsResult): boolean {
   return isExactGeography(result) && result.value !== undefined && result.value !== null;
 }
 
+export type QuickStatsFetcher = (input: QuickStatsInput) => Promise<QuickStatsResult>;
+
 export const chainRegionBriefSchema = {
   name: 'chain_region_brief',
   description: `[⛓체인] 지역 한장 종합 브리핑 — 인구·고용·경제·주거·사회·환경 핵심 13지표 병렬 조회.
@@ -77,12 +83,15 @@ export const chainRegionBriefSchema = {
 
 export type ChainRegionBriefInput = z.infer<typeof chainRegionBriefSchema.inputSchema>;
 
-export async function chainRegionBrief(input: ChainRegionBriefInput) {
+export async function chainRegionBrief(
+  input: ChainRegionBriefInput,
+  statsFetcher: QuickStatsFetcher = quickStats
+) {
   const { region, includeNational, format } = input;
 
   const fetchOne = async (kw: string, regionArg?: string) => {
     try {
-      return await quickStats({ query: kw, region: regionArg });
+      return await statsFetcher({ query: kw, region: regionArg });
     } catch (e) {
       return {
         success: false,
@@ -231,7 +240,10 @@ export const chainCompareRegionsSchema = {
 
 export type ChainCompareRegionsInput = z.infer<typeof chainCompareRegionsSchema.inputSchema>;
 
-export async function chainCompareRegions(input: ChainCompareRegionsInput) {
+export async function chainCompareRegions(
+  input: ChainCompareRegionsInput,
+  statsFetcher: QuickStatsFetcher = quickStats
+) {
   const { regions, keywords } = input;
 
   type Cell = {
@@ -258,7 +270,7 @@ export async function chainCompareRegions(input: ChainCompareRegionsInput) {
     pairs,
     async ({ region, kw }): Promise<Cell> => {
       try {
-        const r = await quickStats({ query: kw, region });
+        const r = await statsFetcher({ query: kw, region });
         const raw = r.value;
         // parseKosisNumber: 값 0을 보존 (parseFloat(...) || null 은 0을 결측 처리해
         // 무역수지 0·자연증가 0 지역이 순위에서 탈락하는 버그)

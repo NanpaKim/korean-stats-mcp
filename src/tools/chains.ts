@@ -8,7 +8,7 @@
  */
 
 import { z } from 'zod';
-import { quickStats } from './quickStats.js';
+import { quickStats, type QuickStatsResult } from './quickStats.js';
 import { quickTrend } from './quickTrend.js';
 import { parseKosisNumber } from '../utils/dataFormatter.js';
 import { mapWithConcurrency, CHAIN_CONCURRENCY } from '../utils/concurrency.js';
@@ -32,6 +32,18 @@ const REGION_BRIEF_INDICATORS = [
   { key: '범죄율',       label: '인구 천명당 범죄발생',     tier: 'social' },
   { key: '미세먼지',     label: 'PM2.5 농도',                tier: 'env' },
 ] as const;
+
+/**
+ * quick_stats의 API 호출 성공과 요청 지역 직접값 여부는 서로 다른 개념이다.
+ * 구버전/외부 mock처럼 geography가 없는 결과는 하위호환상 직접값으로 취급한다.
+ */
+export function isExactGeography(result: QuickStatsResult): boolean {
+  return result.success && (!result.geography || result.geography.match === 'exact');
+}
+
+export function hasExactValue(result: QuickStatsResult): boolean {
+  return isExactGeography(result) && result.value !== undefined && result.value !== null;
+}
 
 export const chainRegionBriefSchema = {
   name: 'chain_region_brief',
@@ -83,15 +95,22 @@ export async function chainRegionBrief(input: ChainRegionBriefInput) {
     REGION_BRIEF_INDICATORS,
     async (ind) => {
       const r = await fetchOne(ind.key, region);
+      const exact = hasExactValue(r);
       return {
         keyword: ind.key,
-        label: ind.label,
+        label: r.metric?.label ?? ind.label,
         tier: ind.tier,
-        success: r.success,
+        // success는 브리핑 지역의 직접값일 때만 true. API 조회 성공은 querySuccess로 분리.
+        success: exact,
+        querySuccess: r.success,
+        status: !r.success ? 'unavailable' : exact ? 'exact' : 'reference',
         value: r.value ?? null,
         unit: r.unit ?? null,
         period: r.period ?? null,
-        source: r.source?.tableName ?? null,
+        source: r.source ?? null,
+        requestedRegion: r.geography?.requested ?? region,
+        actualRegion: r.geography?.actual ?? region,
+        geographyMatch: r.geography?.match ?? 'exact',
         note: r.note ?? null,
         message: r.success ? r.answer?.split('\n')[0] : r.answer,
       };
@@ -111,7 +130,10 @@ export async function chainRegionBrief(input: ChainRegionBriefInput) {
           value: r.value ?? null,
           unit: r.unit ?? null,
           period: r.period ?? null,
-          success: r.success,
+          success: hasExactValue(r),
+          querySuccess: r.success,
+          label: r.metric?.label ?? ind.label,
+          source: r.source ?? null,
         };
       },
       CHAIN_CONCURRENCY
@@ -120,11 +142,15 @@ export async function chainRegionBrief(input: ChainRegionBriefInput) {
 
   const successCount = regional.filter((r) => r.success).length;
   const successItems = regional.filter((r) => r.success);
-  const failedItems = regional.filter((r) => !r.success);
+  const referenceItems = regional.filter((r) => r.status === 'reference');
+  const failedItems = regional.filter((r) => r.status === 'unavailable');
 
-  // 자치구→광역시도 fallback 노트가 있으면 우선 노출 (모든 indicator에 동일 노트가 들어가므로 첫 1개)
-  const districtFallbackNote =
-    regional.find((r) => r.note && r.note.includes('자치구'))?.note ?? null;
+  // 자치구→광역시도 참고값을 별도 집계해 직접값과 섞지 않는다.
+  const districtFallbackNote = referenceItems.length > 0
+    ? `⚠️ 요청 지역 직접값이 아닌 참고값 ${referenceItems.length}건: ${referenceItems
+        .map((r) => `${r.keyword}(${r.actualRegion})`)
+        .join(', ')}`
+    : null;
   const otherNote = regional.find((r) => r.note && !r.note.includes('자치구'))?.note ?? null;
 
   // speech 형식: 상위 5개 핵심 지표만 한 줄 요약
@@ -134,28 +160,36 @@ export async function chainRegionBrief(input: ChainRegionBriefInput) {
       .filter((r) => speechIndicators.includes(r.keyword))
       .map((r) => `${r.label} ${r.value}${r.unit ?? ''}`);
     return {
-      success: true,
+      success: successItems.length > 0,
       region,
       format: 'speech',
       coverage: `${successCount}/${REGION_BRIEF_INDICATORS.length} 지표 가용`,
       speechLine: `${region}의 ${speechLines.join(', ')} (${successItems[0]?.period ?? '-'} 기준).`,
       indicators: successItems.filter((r) => speechIndicators.includes(r.keyword)),
+      references: referenceItems.filter((r) => speechIndicators.includes(r.keyword)),
       fallbackNote: districtFallbackNote ?? otherNote ?? null,
     };
   }
 
   return {
-    success: true,
+    success: successCount > 0,
     region,
     format: 'detail',
     coverage: `${successCount}/${REGION_BRIEF_INDICATORS.length} 지표 조회 성공`,
     indicators: regional,
+    references: referenceItems,
     national,
     summary:
       `📍 **${region} 종합 브리핑** (${successCount}/${REGION_BRIEF_INDICATORS.length} 지표 가용)\n` +
       successItems
         .map((r) => `• ${r.label}: ${r.value}${r.unit ?? ''} (${r.period ?? '-'})`)
         .join('\n') +
+      (referenceItems.length > 0
+        ? `\n\n⚠️ 요청 지역 직접값이 아니어서 가용 건수에서 제외한 참고값(${referenceItems.length}):\n` +
+          referenceItems
+            .map((r) => `• ${r.label}: ${r.actualRegion} ${r.value}${r.unit ?? ''} (${r.period ?? '-'})`)
+            .join('\n')
+        : '') +
       (failedItems.length > 0
         ? `\n\n⚠️ 미가용 지표(${failedItems.length}): ${failedItems.map((r) => r.keyword).join(', ')}`
         : ''),
@@ -209,8 +243,13 @@ export async function chainCompareRegions(input: ChainCompareRegionsInput) {
     unit: string | null;
     period: string | null;
     success: boolean;
+    querySuccess: boolean;
     note?: string | null;
     sourceTableId: string | null;
+    sourceItemId: string | null;
+    requestedRegion: string;
+    actualRegion: string;
+    geographyMatch: string;
   };
 
   // (지역 × 지표) 전체 쌍을 평탄화 후 동시성 제한 실행 — 최대 17×8=136 호출이
@@ -225,6 +264,7 @@ export async function chainCompareRegions(input: ChainCompareRegionsInput) {
         // parseKosisNumber: 값 0을 보존 (parseFloat(...) || null 은 0을 결측 처리해
         // 무역수지 0·자연증가 0 지역이 순위에서 탈락하는 버그)
         const numeric = raw == null ? null : parseKosisNumber(String(raw));
+        const exact = hasExactValue(r);
         return {
           region,
           keyword: kw,
@@ -232,9 +272,14 @@ export async function chainCompareRegions(input: ChainCompareRegionsInput) {
           numericValue: numeric,
           unit: r.unit ?? null,
           period: r.period ?? null,
-          success: r.success,
+          success: exact,
+          querySuccess: r.success,
           note: r.note ?? null,
           sourceTableId: r.source?.tableId ?? null,
+          sourceItemId: r.source?.itemId ?? null,
+          requestedRegion: r.geography?.requested ?? region,
+          actualRegion: r.geography?.actual ?? region,
+          geographyMatch: r.geography?.match ?? 'exact',
         };
       } catch (e) {
         return {
@@ -245,8 +290,13 @@ export async function chainCompareRegions(input: ChainCompareRegionsInput) {
           unit: null,
           period: null,
           success: false,
+          querySuccess: false,
           note: e instanceof Error ? e.message : String(e),
           sourceTableId: null,
+          sourceItemId: null,
+          requestedRegion: region,
+          actualRegion: region,
+          geographyMatch: 'exact',
         };
       }
     },
@@ -298,8 +348,11 @@ export async function chainCompareRegions(input: ChainCompareRegionsInput) {
   const fallbackNotesByRegion = new Map<string, string>();
   for (const m of matrix) {
     for (const c of m.cells) {
-      if (c.note && c.note.includes('자치구') && !fallbackNotesByRegion.has(m.region)) {
-        fallbackNotesByRegion.set(m.region, c.note);
+      if (c.geographyMatch !== 'exact' && !fallbackNotesByRegion.has(m.region)) {
+        fallbackNotesByRegion.set(
+          m.region,
+          `${m.region} 직접값이 아닌 ${c.actualRegion} 참고값이 포함되어 순위 산출에서 제외됐습니다.`
+        );
         break;
       }
     }

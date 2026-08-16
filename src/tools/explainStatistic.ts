@@ -13,7 +13,8 @@ import { z } from 'zod';
 import { getKosisClient } from '../api/client.js';
 import { getCacheManager } from '../cache/index.js';
 import { getQuickStatsParam } from '../data/quickStatsParams.js';
-import { extractKeyword } from './quickStats.js';
+import { DISTRICT_OPENAPI_ROUTES } from '../data/districtFileMap.js';
+import { extractDistrictName, extractKeyword } from './quickStats.js';
 
 export const explainStatisticSchema = {
   name: 'explain_statistic',
@@ -24,7 +25,7 @@ export const explainStatisticSchema = {
 • 수치 조회 → quick_stats (이 도구는 수치가 아니라 통계 자체의 설명·각주)
 • 표 구조(분류·항목) → get_table_info
 
-■ 입력: keyword(예: "출산율") 또는 orgId+tableId (quick_stats/search 응답의 source 그대로)
+■ 입력: quick_stats 응답의 source 객체 전체(권장), 또는 orgId+tableId, 또는 keyword
 ■ 반환: 작성기관·작성목적·조사주기·수록기간·주요 용어해설 + 인용문구(citation) — 보고서 각주에 복붙 가능
 ■ 통계설명이 미등록인 표는 메타 기반 인용문구만 반환`,
   inputSchema: z.object({
@@ -32,6 +33,19 @@ export const explainStatisticSchema = {
       .string()
       .optional()
       .describe('quick_stats 키워드 (예: "출산율", "노령화지수"). orgId/tableId를 모를 때 사용'),
+    region: z
+      .string()
+      .optional()
+      .describe('keyword만 사용할 때의 지역. 자치구면 자치구용 통계표를 선택합니다. 정확한 각주는 source 전달 권장.'),
+    source: z
+      .object({
+        orgId: z.string(),
+        tableId: z.string(),
+        tableName: z.string().optional(),
+        itemId: z.string().optional(),
+      })
+      .optional()
+      .describe('quick_stats 응답의 source 객체를 그대로 전달. 수치와 각주가 같은 통계표를 가리키도록 하는 가장 안전한 방식.'),
     orgId: z.string().optional().describe('기관 ID (예: "101"). quick_stats 응답의 source.orgId'),
     tableId: z
       .string()
@@ -74,25 +88,42 @@ export async function explainStatistic(input: ExplainStatisticInput): Promise<{
   answer: string;
   citation?: string;
   explanation?: Record<string, string>;
-  source?: { orgId: string; tableId: string; tableName: string; retrievedAt: string };
+  source?: { orgId: string; tableId: string; tableName: string; itemId?: string; retrievedAt: string };
+  resolution?: 'source' | 'explicit-ids' | 'region-keyword' | 'keyword-default';
   note?: string;
 }> {
   const client = getKosisClient();
   const cache = getCacheManager();
 
   try {
-    // 1. orgId/tableId 결정 — 직접 입력 우선, 없으면 keyword로 resolve
-    let orgId = input.orgId?.trim();
-    let tableId = input.tableId?.trim();
-    let tableNameHint: string | null = null;
+    // 1. orgId/tableId 결정 — quick_stats source 객체가 최우선.
+    // keyword 단독은 지역별 라우팅 표와 다를 수 있으므로 resolution에 명시한다.
+    let orgId = input.source?.orgId.trim() || input.orgId?.trim();
+    let tableId = input.source?.tableId.trim() || input.tableId?.trim();
+    let itemId = input.source?.itemId?.trim();
+    let tableNameHint: string | null = input.source?.tableName?.trim() || null;
+    let resolution: 'source' | 'explicit-ids' | 'region-keyword' | 'keyword-default' =
+      input.source ? 'source' : orgId && tableId ? 'explicit-ids' : 'keyword-default';
 
     if ((!orgId || !tableId) && input.keyword) {
       const kw = extractKeyword(input.keyword.trim());
-      const param = getQuickStatsParam(kw);
-      if (param) {
-        orgId = orgId || param.orgId;
-        tableId = tableId || param.tableId;
-        tableNameHint = param.tableName;
+      const districtName = input.region ? extractDistrictName(input.region.trim()) : null;
+      const districtRoute = districtName ? DISTRICT_OPENAPI_ROUTES[kw] : undefined;
+      if (districtRoute) {
+        orgId = orgId || districtRoute.orgId;
+        tableId = tableId || districtRoute.tblId;
+        itemId = itemId || districtRoute.itmId;
+        tableNameHint = districtRoute.description;
+        resolution = 'region-keyword';
+      } else {
+        const param = getQuickStatsParam(kw);
+        if (param) {
+          orgId = orgId || param.orgId;
+          tableId = tableId || param.tableId;
+          itemId = itemId || param.itemId;
+          tableNameHint = param.tableName;
+          resolution = 'keyword-default';
+        }
       }
     }
     if (!orgId || !tableId) {
@@ -150,7 +181,7 @@ export async function explainStatistic(input: ExplainStatisticInput): Promise<{
     const citation =
       `출처: ${orgName}` +
       (statName ? `, 「${statName}」` : '') +
-      `, ${tableName} (KOSIS, 통계표 ID: ${tableId}), ${today} 추출.`;
+      `, ${tableName} (KOSIS, 통계표 ID: ${tableId}${itemId ? `, 항목 ID: ${itemId}` : ''}), ${today} 추출.`;
 
     // 4. 설명 본문
     const explanation: Record<string, string> = {};
@@ -168,6 +199,14 @@ export async function explainStatistic(input: ExplainStatisticInput): Promise<{
     }
 
     const hasExplain = bodyLines.length > 0;
+    const notes = [
+      resolution === 'keyword-default'
+        ? 'keyword 기본표로 각주를 생성했습니다. 수치와 완전히 같은 표인지 보장하려면 quick_stats 응답의 source 객체를 전달하세요.'
+        : null,
+      !hasExplain
+        ? '용어 정의가 필요하면 해당 조사의 대표 표 ID로 다시 시도하거나 search_statistics로 본조사 표를 찾으세요.'
+        : null,
+    ].filter((note): note is string => !!note);
     const answer =
       `📚 ${tableName} (${orgName}, KOSIS ${tableId})\n\n` +
       (hasExplain
@@ -180,10 +219,9 @@ export async function explainStatistic(input: ExplainStatisticInput): Promise<{
       answer,
       citation,
       ...(hasExplain ? { explanation } : {}),
-      source: { orgId, tableId, tableName, retrievedAt: today },
-      ...(hasExplain
-        ? {}
-        : { note: '용어 정의가 필요하면 해당 조사의 대표 표 ID로 다시 시도하거나 search_statistics로 본조사 표를 찾으세요.' }),
+      source: { orgId, tableId, tableName, ...(itemId ? { itemId } : {}), retrievedAt: today },
+      resolution,
+      ...(notes.length > 0 ? { note: notes.join(' / ') } : {}),
     };
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);

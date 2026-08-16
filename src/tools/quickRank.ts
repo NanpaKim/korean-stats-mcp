@@ -1,7 +1,7 @@
 /**
  * 전국 순위 카드 — "우리 시·구가 전국 몇 위?"
  *
- * 동급 지자체 전체(17개 시도 또는 220+ 시군구)를 단일 KOSIS 호출(objL='ALL')로 받아
+ * 동급 지자체 전체(17개 시도 또는 동일 행정유형의 시·군·자치구·일반구)를 단일 KOSIS 호출(objL='ALL')로 받아
  * 해당 지역의 순위·백분위·전국 평균 대비 격차·직전 시점 대비 순위 변동을 산출한다.
  *
  * 연설문·보도자료의 핵심 수사는 절대값이 아니라 상대 위치와 순위 변동 —
@@ -41,7 +41,7 @@ export const quickRankSchema = {
 • 사용자가 지정한 2~17개 지역 비교 → chain_compare_regions (이 도구는 동급 전체 자동 비교)
 • 추세 → quick_trend
 
-■ region이 시도(서울 등) → 17개 시도 중 순위, 시군구(광진구 등) → 전국 시군구 전수 중 순위
+■ region이 시도(서울 등) → 17개 시도 중 순위, 시군구 → 같은 행정유형(시/군/자치구/일반구) 안에서 순위
 ■ 같은 통계표·같은 시점 단일 호출 — 비교가능성 보장 + 직전 시점 대비 순위 변동(↑↓) 포함
 ■ 정렬은 값 내림차순(값 큰 순 = 1위). 실업률처럼 낮을수록 좋은 지표는 해석 주의 문구 자동 부착`,
   inputSchema: z.object({
@@ -81,7 +81,56 @@ interface QuickRankResult {
   top5?: RankEntry[];
   bottom5?: RankEntry[];
   source?: { orgId: string; tableId: string; tableName: string; retrievedAt: string };
+  comparisonGroup?: {
+    type: DistrictComparisonGroup | 'sido';
+    label: string;
+    included: number;
+    allRows: number;
+    breakdown?: Record<DistrictComparisonGroup, number>;
+  };
   note?: string;
+}
+
+export type DistrictComparisonGroup =
+  | 'si'
+  | 'gun'
+  | 'autonomous-gu'
+  | 'general-gu'
+  | 'unknown-gu';
+
+const DISTRICT_GROUP_LABELS: Record<DistrictComparisonGroup, string> = {
+  si: '전국 기초시',
+  gun: '전국 군',
+  'autonomous-gu': '전국 자치구',
+  'general-gu': '전국 일반구',
+  'unknown-gu': '전국 구(자치구·일반구 혼합 가능)',
+};
+
+/** KOSIS 행 이름을 행정유형별 비교집단으로 분류한다. */
+export function classifyDistrictRowName(name: string): DistrictComparisonGroup | null {
+  const normalized = name.trim().replace(/\s+/g, ' ');
+  const parts = normalized.split(' ');
+  const last = parts[parts.length - 1] ?? normalized;
+  if (last.endsWith('시')) return 'si';
+  if (last.endsWith('군')) return 'gun';
+  if (!last.endsWith('구')) return null;
+
+  // "청주시 상당구", "수원시 장안구"처럼 기초시 아래에 놓인 구는 일반구.
+  const parentParts = parts.slice(0, -1);
+  if (parentParts.some((p) => /시$/.test(p) && !/(특별시|광역시|특별자치시)$/.test(p))) {
+    return 'general-gu';
+  }
+
+  // 서울·6개 광역시의 구는 자치구. 단독 이름도 정적 지역 매핑으로 보정한다.
+  const metroNames = new Set(['서울', '부산', '대구', '인천', '광주', '대전', '울산']);
+  if (parentParts.some((p) => metroNames.has(normalizeProvinceName(p)))) {
+    return 'autonomous-gu';
+  }
+  const province = findProvinceByDistrict(last);
+  if (province && ['201', '202', '203', '204', '205', '206', '207'].includes(province.orgId)) {
+    return 'autonomous-gu';
+  }
+  return 'unknown-gu';
 }
 
 /** 낮을수록 긍정적으로 읽히는 지표 — 1위(값 최대)가 "나쁨"일 수 있어 해석 주의 부착 */
@@ -237,26 +286,43 @@ export async function quickRank(input: QuickRankInput): Promise<QuickRankResult>
         };
       }
 
-      const ranking = buildRanking(latest);
-      const targetIdx = ranking.findIndex((e) =>
-        latest.some((l) => l.name === e.region && targetCodes.includes(l.code) && l.value === e.value)
-      );
-      if (targetIdx === -1) {
+      const targetRaw = latest.find((entry) => targetCodes.includes(entry.code));
+      if (!targetRaw) {
         return {
           success: false,
           answer: `${districtName}의 "${keyword}" 값이 최신 시점(${latestPrd})에 결측입니다.`,
-          note: `전수 ${ranking.length}곳 순위 자체는 산출 가능 — chain_compare_regions 참고.`,
+          note: `전수 ${latest.length}곳 응답에는 값이 있으나 기준 지역 값이 없습니다 — chain_compare_regions 참고.`,
         };
       }
+      const targetGroup = classifyDistrictRowName(targetRaw.name) ?? 'unknown-gu';
+      const sameGroup = latest.filter((entry) => classifyDistrictRowName(entry.name) === targetGroup);
+      const comparisonRows = sameGroup.length >= 2 ? sameGroup : latest;
+      const comparisonLabel = sameGroup.length >= 2
+        ? DISTRICT_GROUP_LABELS[targetGroup]
+        : 'KOSIS 시군구 전체(행정유형 분리 불가)';
+      const ranking = buildRanking(comparisonRows);
+      const targetIdx = ranking.findIndex((entry) => entry.region === targetRaw.name);
       const target = ranking[targetIdx];
       const total = ranking.length;
       const percentile = ((target.rank / total) * 100).toFixed(0);
-      const average = latest.reduce((s, e) => s + e.value, 0) / total;
+      const average = comparisonRows.reduce((s, e) => s + e.value, 0) / total;
+
+      const groupTypes: DistrictComparisonGroup[] = [
+        'si', 'gun', 'autonomous-gu', 'general-gu', 'unknown-gu',
+      ];
+      const breakdown = Object.fromEntries(
+        groupTypes.map((group) => [
+          group,
+          latest.filter((entry) => classifyDistrictRowName(entry.name) === group).length,
+        ])
+      ) as Record<DistrictComparisonGroup, number>;
 
       // 직전 시점 순위 변동
       let rankChange: number | null = null;
       if (prevPrd) {
-        const prevRanking = buildRanking(toEntries(prevPrd));
+        const prevRanking = buildRanking(
+          toEntries(prevPrd).filter((entry) => classifyDistrictRowName(entry.name) === targetGroup)
+        );
         const prevIdx = prevRanking.findIndex((e) => e.region === target.region);
         if (prevIdx !== -1) rankChange = prevRanking[prevIdx].rank - target.rank; // +N = 상승
       }
@@ -274,10 +340,10 @@ export async function quickRank(input: QuickRankInput): Promise<QuickRankResult>
 
       const answer =
         `${latestPrd.length === 4 ? `${latestPrd}년` : latestPrd} ${route.description} 기준, ` +
-        `${districtName}은(는) 전국 시군구 ${total}곳 중 ${target.rank}위입니다 (상위 ${percentile}%, ${target.formatted}${unit})${changeText}.\n` +
-        `전국 시군구 평균 ${fmt(average)}${unit} 대비 ${target.value >= average ? '+' : ''}${fmt(target.value - average)}${unit}.` +
+        `${districtName}은(는) ${comparisonLabel} ${total}곳 중 ${target.rank}위입니다 (상위 ${percentile}%, ${target.formatted}${unit})${changeText}.\n` +
+        `${comparisonLabel} 평균 ${fmt(average)}${unit} 대비 ${target.value >= average ? '+' : ''}${fmt(target.value - average)}${unit}.` +
         cautionNote +
-        `\n\n📊 출처: ${route.description} (KOSIS ${route.tblId}) — 전체 시군구 동일 표·동일 시점 단일 조회 (비교가능성 보장)`;
+        `\n\n📊 출처: ${route.description} (KOSIS ${route.tblId}) — 동일 표·동일 시점, 비교집단: ${comparisonLabel} ${total}곳 (원응답 시군구형 행 ${latest.length}곳)`;
 
       return {
         success: true,
@@ -296,6 +362,13 @@ export async function quickRank(input: QuickRankInput): Promise<QuickRankResult>
         rankChange,
         top5: ranking.slice(0, 5),
         bottom5: ranking.slice(-5),
+        comparisonGroup: {
+          type: targetGroup,
+          label: comparisonLabel,
+          included: total,
+          allRows: latest.length,
+          breakdown,
+        },
         source: {
           orgId: route.orgId,
           tableId: route.tblId,
@@ -465,6 +538,12 @@ export async function quickRank(input: QuickRankInput): Promise<QuickRankResult>
         tableId: param.tableId,
         tableName: param.tableName,
         retrievedAt: new Date().toISOString().slice(0, 10),
+      },
+      comparisonGroup: {
+        type: 'sido',
+        label: '17개 시도',
+        included: total,
+        allRows: latest.length,
       },
     };
   } catch (error) {

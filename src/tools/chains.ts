@@ -126,7 +126,6 @@ export async function chainRegionBrief(input: ChainRegionBriefInput) {
         const r = await fetchOne(ind.key);
         return {
           keyword: ind.key,
-          label: ind.label,
           value: r.value ?? null,
           unit: r.unit ?? null,
           period: r.period ?? null,

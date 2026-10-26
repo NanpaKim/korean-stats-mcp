@@ -309,6 +309,7 @@ AI 앱 설정에 발급받은 키를 넣습니다.
 - v1.8.6: 응답 캐시를 크기 상한 LRU(기본 32MB, `CACHE_MAX_MB`)로 교체. 종전 캐시는 키 1,000개가 차면 저장 단계에서 예외를 던져 KOSIS 응답을 받아 놓고도 요청이 실패했고, 바이트 상한이 없어 통합 호스트에서 프로세스 하나가 RSS 434MB를 차지했다
 - v1.8.7: `fetch_kosis_excel` 복구. KOSIS 가 2026-08-05 다운로드 절차에 `srvcNm` 필드를 요구하도록 바뀌어 xlsx 대신 오류 페이지만 받고 있었다
 - v1.8.8: 외부 API 장애(연결 시간 초과·끊김·5xx·형식이 틀린 응답·KOSIS 오류 코드)를 MCP `isError=true` 로 낸다. 종전엔 `success:false` JSON 을 정상 도구 결과로 돌려줘 클라이언트가 장애를 답으로 받았고, 자치구 통계연보 경로는 장애를 "미수록 + 상위 지역 값"으로 바꿔 냈다. 오류 본문에는 원인 코드와 대상 호스트만 싣는다(예: `kosis.kr (UND_ERR_CONNECT_TIMEOUT)`). 0건·요청 변수 오류는 종전처럼 일반 결과
+- v1.8.9: 보안 — 의존성 취약점 19건(high 5·moderate 10·low 4)을 0건으로. zod 3 → 4.6.7(GHSA-mrhx-c7xc-m3w5), 자치구 엑셀 파싱용 kordoc 2.x → 4.24.8(zod 3 을 끌고 오지 않는 판), MCP SDK 1.32.2·express 4.22.3, 개발용 vitest 4.1.12·vite 8.3.5. 도구 14개의 입력 스키마·이름·설명 그대로(정수 범위가 명시된 것만 다름)
 - **배포를 통합 호스트로 이전** — 공식 주소 `mcp.gomdori.app/stats` (구 `korean-stats-mcp.fly.dev` 중단)
 
 </details>

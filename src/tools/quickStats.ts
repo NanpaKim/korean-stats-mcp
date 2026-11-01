@@ -93,16 +93,39 @@ export const quickStatsSchema = {
 
 export type QuickStatsInput = z.infer<typeof quickStatsSchema.inputSchema>;
 
-interface QuickStatsResult {
+export type GeographyLevel = 'national' | 'province' | 'district';
+export type GeographyMatch = 'exact' | 'parent' | 'national-reference';
+
+export interface QuickStatsGeography {
+  /** 사용자가 요청한 지역 (정규화된 표시명) */
+  requested: string;
+  /** 반환된 수치가 실제로 가리키는 지역 */
+  actual: string;
+  requestedLevel: GeographyLevel;
+  actualLevel: GeographyLevel;
+  /** exact가 아니면 요청 지역의 직접값이 아니라 참고용 대체값 */
+  match: GeographyMatch;
+}
+
+export interface QuickStatsResult {
   success: boolean;
   answer: string;
   value?: number | string;
   unit?: string;
   period?: string;
+  /** 실제 조회된 지표명·단위. 체인 도구는 고정 라벨 대신 이 값을 사용한다. */
+  metric?: {
+    keyword: string;
+    label: string;
+    unit: string;
+  };
+  /** 요청 지역과 실제 데이터 지역을 분리해 silent fallback을 방지한다. */
+  geography?: QuickStatsGeography;
   source?: {
     orgId: string;
     tableId: string;
     tableName: string;
+    itemId?: string;
     /** KOSIS 자료 최종수정일 (LST_CHN_DE) — 공문서 인용용 */
     lastUpdated?: string;
     /** 조회(추출) 시점 ISO 날짜 — 공문서 인용용 */
@@ -388,10 +411,19 @@ export async function quickStats(input: QuickStatsInput): Promise<QuickStatsResu
                 value: formattedValue,
                 unit: route.unit,
                 period: periodLabel,
+                metric: { keyword, label: route.description, unit: route.unit },
+                geography: {
+                  requested: districtName,
+                  actual: districtName,
+                  requestedLevel: 'district',
+                  actualLevel: 'district',
+                  match: 'exact',
+                },
                 source: {
                   orgId: route.orgId,
                   tableId: route.tblId,
                   tableName: route.description,
+                  itemId: route.itmId,
                 },
                 ...(route.isProjection ? { isProjection: true } : {}),
               };
@@ -458,6 +490,14 @@ export async function quickStats(input: QuickStatsInput): Promise<QuickStatsResu
               value,
               unit: unitLabel,
               period: periodLabel || undefined,
+              metric: { keyword, label: param.description, unit: unitLabel },
+              geography: {
+                requested: districtName,
+                actual: districtName,
+                requestedLevel: 'district',
+                actualLevel: 'district',
+                match: 'exact',
+              },
               source: { orgId: excelResult.orgId, tableId, tableName: sourceName },
             };
           }
@@ -477,6 +517,14 @@ export async function quickStats(input: QuickStatsInput): Promise<QuickStatsResu
             success: true,
             answer,
             period: periodLabel || undefined,
+            metric: { keyword, label: param.description, unit: param.unit ?? '' },
+            geography: {
+              requested: districtName,
+              actual: districtName,
+              requestedLevel: 'district',
+              actualLevel: 'district',
+              match: 'exact',
+            },
             source: { orgId: excelResult.orgId, tableId, tableName: sourceName },
             note: `자동 value 추출 실패 — highlight pattern 보강 필요 (keyword="${keyword}").`,
           };
@@ -665,16 +713,35 @@ export async function quickStats(input: QuickStatsInput): Promise<QuickStatsResu
       .filter(Boolean)
       .join(' / ');
 
+    const geography: QuickStatsGeography = districtName
+      ? {
+          requested: districtName,
+          actual: regionName,
+          requestedLevel: 'district',
+          actualLevel: regionName === '전국' ? 'national' : 'province',
+          match: regionName === '전국' ? 'national-reference' : 'parent',
+        }
+      : {
+          requested: regionName,
+          actual: regionName,
+          requestedLevel: regionName === '전국' ? 'national' : 'province',
+          actualLevel: regionName === '전국' ? 'national' : 'province',
+          match: 'exact',
+        };
+
     return {
       success: true,
       answer,
       value,
       unit,
       period: periodFormatted,
+      metric: { keyword, label: param.description, unit },
+      geography,
       source: {
         orgId: param.orgId,
         tableId: param.tableId,
         tableName: param.tableName,
+        itemId: param.itemId,
         ...(latestData.LST_CHN_DE ? { lastUpdated: latestData.LST_CHN_DE } : {}),
         retrievedAt: new Date().toISOString().slice(0, 10),
       },

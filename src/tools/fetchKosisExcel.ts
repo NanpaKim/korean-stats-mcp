@@ -26,6 +26,7 @@ async function loadKordoc(): Promise<((ab: ArrayBuffer) => Promise<any>) | null>
 }
 import { resolveDistrictFileTable } from '../utils/regions.js';
 import { resolveFileSnByKeyword } from '../data/districtFileMap.js';
+import { UpstreamError, toUpstreamError, rethrowIfUpstream } from '../utils/errorHandler.js';
 
 const KOSIS_HOST = 'https://stat.kosis.kr';
 const KOSIS_BASE = `${KOSIS_HOST}/nsibsHtmlSvc/fileView/FileStbl`;
@@ -52,7 +53,37 @@ async function fetchWithRetry(url: string, init: RequestInit, attempts = 3): Pro
       if (i < attempts - 1) await new Promise((r) => setTimeout(r, 800 * (i + 1)));
     }
   }
-  throw lastErr;
+  // 원인 코드와 호스트 이름만 남긴다 (URL 쿼리·원본 메시지 제외)
+  throw toUpstreamError(lastErr, new URL(url).hostname);
+}
+
+/**
+ * 응답 본문 읽기 — 받는 도중 연결이 끊기거나(undici 'terminated') 15초 시간 초과가 나도 업스트림 장애로 올린다.
+ * fetchWithRetry 는 응답 헤더까지만 감싼다.
+ */
+async function readBody<T>(read: () => Promise<T>, url: string): Promise<T> {
+  try {
+    return await read();
+  } catch (e) {
+    throw toUpstreamError(e, new URL(url).hostname);
+  }
+}
+
+/**
+ * 기대한 형식이 아닌 응답(JSON 아님·다운로드 경로 누락·xlsx 아님) → 업스트림 장애 INVALID_RESPONSE.
+ * 진단 스니펫은 서버 stderr 로그에만 남긴다 — URL·키·세션 값은 가리고, 응답 본문에는 싣지 않는다.
+ */
+function invalidResponse(url: string, what: string, snippet: string): UpstreamError {
+  const host = new URL(url).hostname;
+  const masked = snippet
+    .replace(/https?:\/\/[^\s"'<>]+/gi, '<url>')
+    .replace(/([\w.-]*(?:key|token|secret|pass|session|auth)[\w.-]*)=[^&\s"'<>;]*/gi, '$1=***')
+    .replace(/\b(Bearer|Basic)\s+[\w.~+/=-]+/gi, '$1 ***')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 200);
+  console.error(`[upstream] ${host} INVALID_RESPONSE ${what}: ${masked}`);
+  return new UpstreamError('INVALID_RESPONSE', host);
 }
 
 export const fetchKosisExcelSchema = {
@@ -138,8 +169,10 @@ async function fetchTableView(orgId: string, tblId: string): Promise<{ cookie: s
       'Accept': 'text/html',
     },
   });
-  if (!res.ok) throw new Error(`fileStblView.do HTTP ${res.status}`);
-  return { cookie: extractCookies(res), html: await res.text() };
+  // 404 = 그 연도 파일 통계표 미제공 — 호출 측이 다음 후보로 넘어간다 (업스트림 장애 아님)
+  if (res.status === 404) throw new Error('fileStblView.do HTTP 404');
+  if (!res.ok) throw new UpstreamError(`HTTP_${res.status}`, new URL(url).hostname);
+  return { cookie: extractCookies(res), html: await readBody(() => res.text(), url) };
 }
 
 /**
@@ -203,7 +236,7 @@ async function fetchDownloadInfo(
   tblId: string,
   fileSn: number,
   cookie: string
-): Promise<{ dwldFilePath: string; dwldFileNm: string; dwldFileSize?: number }> {
+): Promise<{ dwldFilePath: string; dwldFileNm: string; dwldFileSize?: number; srvcNm?: string }> {
   const url = `${KOSIS_BASE}/fileItmDownload.do`;
   const body = new URLSearchParams({
     vw_cd: 'NULL',
@@ -225,22 +258,31 @@ async function fetchDownloadInfo(
     },
     body: body.toString(),
   });
-  if (!res.ok) throw new Error(`fileItmDownload.do HTTP ${res.status}`);
-  const json = (await res.json()) as {
+  if (!res.ok) throw new UpstreamError(`HTTP_${res.status}`, new URL(url).hostname);
+  // 본문을 텍스트로 먼저 받는다 — JSON 이 아니면 진단 스니펫을 남길 수 있게
+  const text = await readBody(() => res.text(), url);
+  let json: {
     resultMap?: { dwldFilePath?: string; dwldFileNm?: string; dwldFileSize?: number; srvcNm?: string };
     dwldFilePath?: string;
     dwldFileNm?: string;
     dwldFileSize?: number;
+    srvcNm?: string;
   };
+  try {
+    json = JSON.parse(text) ?? {};
+  } catch {
+    throw invalidResponse(url, 'fileItmDownload.do JSON 아님', text);
+  }
   // 응답 형식: { resultMap: { dwldFilePath, dwldFileNm, dwldFileSize }, baseinfo, success }
   // 일부 응답은 최상위에 직접 둘 수 있으므로 양쪽 모두 확인
   const path = json.resultMap?.dwldFilePath ?? json.dwldFilePath;
   const name = json.resultMap?.dwldFileNm ?? json.dwldFileNm;
   const size = json.resultMap?.dwldFileSize ?? json.dwldFileSize;
+  const srvcNm = json.resultMap?.srvcNm ?? json.srvcNm;
   if (!path || !name) {
-    throw new Error(`fileItmDownload.do 응답 누락: ${JSON.stringify(json).slice(0, 300)}`);
+    throw invalidResponse(url, 'fileItmDownload.do 다운로드 경로 누락', JSON.stringify(json));
   }
-  return { dwldFilePath: path, dwldFileNm: name, dwldFileSize: size };
+  return { dwldFilePath: path, dwldFileNm: name, dwldFileSize: size, srvcNm };
 }
 
 /** 3단계: dwldServerFile.do POST → 실제 xlsx 바이너리 */
@@ -248,7 +290,7 @@ async function downloadFile(
   orgId: string,
   tblId: string,
   fileSn: number,
-  info: { dwldFilePath: string; dwldFileNm: string },
+  info: { dwldFilePath: string; dwldFileNm: string; srvcNm?: string },
   cookie: string
 ): Promise<ArrayBuffer> {
   const url = `${KOSIS_BASE}/dwldServerFile.do`;
@@ -260,6 +302,9 @@ async function downloadFile(
     fileSvc: '',
     file_path: info.dwldFilePath,
     file_name: info.dwldFileNm,
+    // KOSIS 가 2026-08-05 "웹취약수정"으로 dwldServerFile.do 에 srvcNm(2단계 응답값)을 요구한다.
+    // 빠지면 xlsx 대신 eGovFrame 오류 페이지(2,392B)를 준다(2026-09-23 실측: 넣으면 140,110B xlsx).
+    srvcNm: info.srvcNm ?? '',
   });
   const res = await fetchWithRetry(url, {
     method: 'POST',
@@ -271,8 +316,15 @@ async function downloadFile(
     },
     body: body.toString(),
   });
-  if (!res.ok) throw new Error(`dwldServerFile.do HTTP ${res.status}`);
-  return res.arrayBuffer();
+  if (!res.ok) throw new UpstreamError(`HTTP_${res.status}`, new URL(url).hostname);
+  const ab = await readBody(() => res.arrayBuffer(), url);
+  // 매직바이트 확인 (xlsx = PK\x03\x04) — 200 인데 xlsx 가 아니면 오류 페이지(eGovFrame 등)
+  const head = new Uint8Array(ab.slice(0, 4));
+  if (!(head[0] === 0x50 && head[1] === 0x4b)) {
+    const snippet = new TextDecoder('utf-8', { fatal: false }).decode(ab.slice(0, 500));
+    throw invalidResponse(url, `dwldServerFile.do xlsx 아님 (${ab.byteLength}B)`, snippet);
+  }
+  return ab;
 }
 
 export async function fetchKosisExcel(input: FetchKosisExcelInput): Promise<ExcelFetchResult> {
@@ -379,24 +431,8 @@ export async function fetchKosisExcel(input: FetchKosisExcelInput): Promise<Exce
     // 2단계 — 다운로드 정보
     const info = await fetchDownloadInfo(orgId, tblId, effectiveFileSn, cookie);
 
-    // 3단계 — 실제 파일
+    // 3단계 — 실제 파일 (xlsx 가 아니면 downloadFile 이 업스트림 장애로 던진다)
     const ab = await downloadFile(orgId, tblId, effectiveFileSn, info, cookie);
-
-    // 매직바이트 확인 (xlsx = PK\x03\x04)
-    const head = new Uint8Array(ab.slice(0, 4));
-    if (!(head[0] === 0x50 && head[1] === 0x4b)) {
-      const decoder = new TextDecoder('utf-8', { fatal: false });
-      const snippet = decoder.decode(ab.slice(0, 500));
-      return {
-        success: false,
-        orgId,
-        tblId,
-        fileSn: effectiveFileSn,
-        fileName: fileMeta?.file_nm ?? info.dwldFileNm,
-        byteSize: ab.byteLength,
-        error: `XLSX가 아닌 응답 (${ab.byteLength}B): ${snippet.slice(0, 300)}`,
-      };
-    }
 
     // kordoc 파싱 (XLSX → 마크다운). 원격 배포에선 미설치라 안내 후 종료.
     const parse = await loadKordoc();
@@ -437,6 +473,7 @@ export async function fetchKosisExcel(input: FetchKosisExcelInput): Promise<Exce
       warnings: result.warnings?.map((w: { message: string }) => w.message),
     };
   } catch (e) {
+    rethrowIfUpstream(e);
     return {
       success: false,
       orgId: input.orgId ?? '',

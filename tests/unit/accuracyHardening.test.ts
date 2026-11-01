@@ -67,6 +67,17 @@ describe('지역 브리핑 정확성', () => {
     expect(brief.summary).not.toContain('13/13');
   });
 
+  it('표 조회에 성공해도 추출한 수치가 없으면 참고값에서 제외한다', async () => {
+    const brief = await chainRegionBrief(
+      { region: '송파구', includeNational: false, format: 'detail' },
+      async ({ query }) => ({ ...result(query, '송파구', '송파구', 'exact'), value: undefined })
+    );
+
+    expect(brief.coverage).toBe('0/13 지표 조회 성공');
+    expect(brief.references).toHaveLength(0);
+    expect(brief.indicators[0]).toMatchObject({ status: 'unavailable', querySuccess: true });
+  });
+
   it('고정 라벨 대신 실제 조회 항목명을 사용한다', async () => {
     const fakeStats: QuickStatsFetcher = async ({ query, region }) => (
       result(query, region!, region!, 'exact')

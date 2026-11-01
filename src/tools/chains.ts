@@ -112,7 +112,7 @@ export async function chainRegionBrief(
         // success는 브리핑 지역의 직접값일 때만 true. API 조회 성공은 querySuccess로 분리.
         success: exact,
         querySuccess: r.success,
-        status: !r.success ? 'unavailable' : exact ? 'exact' : 'reference',
+        status: !r.success || r.value == null ? 'unavailable' : exact ? 'exact' : 'reference',
         value: r.value ?? null,
         unit: r.unit ?? null,
         period: r.period ?? null,

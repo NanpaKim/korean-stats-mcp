@@ -82,7 +82,7 @@ interface QuickRankResult {
   bottom5?: RankEntry[];
   source?: { orgId: string; tableId: string; tableName: string; retrievedAt: string };
   comparisonGroup?: {
-    type: DistrictComparisonGroup | 'sido';
+    type: DistrictComparisonGroup | 'sido' | 'all-districts';
     label: string;
     included: number;
     allRows: number;
@@ -150,11 +150,11 @@ function fmt(n: number): string {
 
 function buildRanking(
   rows: Array<{ name: string; code: string; value: number }>
-): RankEntry[] {
+): Array<RankEntry & { code: string }> {
   return rows
     .slice()
     .sort((a, b) => b.value - a.value)
-    .map((r, i) => ({ rank: i + 1, region: r.name, value: r.value, formatted: fmt(r.value) }));
+    .map((r, i) => ({ rank: i + 1, region: r.name, code: r.code, value: r.value, formatted: fmt(r.value) }));
 }
 
 export async function quickRank(input: QuickRankInput): Promise<QuickRankResult> {
@@ -296,13 +296,13 @@ export async function quickRank(input: QuickRankInput): Promise<QuickRankResult>
       }
       const targetGroup = classifyDistrictRowName(targetRaw.name) ?? 'unknown-gu';
       const sameGroup = latest.filter((entry) => classifyDistrictRowName(entry.name) === targetGroup);
-      const comparisonRows = sameGroup.length >= 2 ? sameGroup : latest;
-      const comparisonLabel = sameGroup.length >= 2
+      const useSameGroup = sameGroup.length >= 2;
+      const comparisonRows = useSameGroup ? sameGroup : latest;
+      const comparisonLabel = useSameGroup
         ? DISTRICT_GROUP_LABELS[targetGroup]
         : 'KOSIS 시군구 전체(행정유형 분리 불가)';
       const ranking = buildRanking(comparisonRows);
-      const targetIdx = ranking.findIndex((entry) => entry.region === targetRaw.name);
-      const target = ranking[targetIdx];
+      const target = ranking.find((entry) => entry.code === targetRaw.code)!;
       const total = ranking.length;
       const percentile = ((target.rank / total) * 100).toFixed(0);
       const average = comparisonRows.reduce((s, e) => s + e.value, 0) / total;
@@ -320,11 +320,14 @@ export async function quickRank(input: QuickRankInput): Promise<QuickRankResult>
       // 직전 시점 순위 변동
       let rankChange: number | null = null;
       if (prevPrd) {
-        const prevRanking = buildRanking(
-          toEntries(prevPrd).filter((entry) => classifyDistrictRowName(entry.name) === targetGroup)
-        );
-        const prevIdx = prevRanking.findIndex((e) => e.region === target.region);
-        if (prevIdx !== -1) rankChange = prevRanking[prevIdx].rank - target.rank; // +N = 상승
+        const previous = toEntries(prevPrd);
+        const previousPeers = useSameGroup
+          ? previous.filter((entry) => classifyDistrictRowName(entry.name) === targetGroup)
+          : previous;
+        if (previousPeers.length >= 2) {
+          const previousTarget = buildRanking(previousPeers).find((entry) => entry.code === target.code);
+          if (previousTarget) rankChange = previousTarget.rank - target.rank;
+        }
       }
 
       const unit = route.unit;
@@ -363,7 +366,7 @@ export async function quickRank(input: QuickRankInput): Promise<QuickRankResult>
         top5: ranking.slice(0, 5),
         bottom5: ranking.slice(-5),
         comparisonGroup: {
-          type: targetGroup,
+          type: useSameGroup ? targetGroup : 'all-districts',
           label: comparisonLabel,
           included: total,
           allRows: latest.length,
